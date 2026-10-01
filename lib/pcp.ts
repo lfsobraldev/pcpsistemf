@@ -81,37 +81,371 @@ function expandir(pedido:string,item:string,codigo:string,descricao:string,qtd:n
     rebaixo:rb,acabamento:f.acabamento,cor:f.cor,quantidade:qtd,grupo,status:categoria==="OUTROS"?"REVISÃO":"PENDENTE"})];
 }
 
-export async function lerPedidoPdf(file:File):Promise<ParseResult>{
-  const pdfjs=await import("pdfjs-dist/legacy/build/pdf.mjs");
-  const pdf=await pdfjs.getDocument({data:new Uint8Array(await file.arrayBuffer()),useWorkerFetch:false,isEvalSupported:false,useSystemFonts:true}).promise;
-  const pages:string[]=[];
-  for(let n=1;n<=pdf.numPages;n++){
-    const page=await pdf.getPage(n),content=await page.getTextContent();
-    pages.push((content.items as any[]).map(x=>String(x.str||"")).join(" "));
-  }
-  const texto=pages.join("\n");
-  const campo=(re:RegExp)=>clean(texto.match(re)?.[1]||"");
-  const meta={pedido:campo(/Pedido:\s*(\d+)/i),cliente:campo(/Cliente:\s*([^\n]+?)(?=\s+CNPJ:|\s+Endere[cç]o:|$)/i),
-    cidade:campo(/Cidade:\s*([A-ZÀ-Ú0-9 \-]+?)(?=\s+Data Emiss[aã]o:|$)/i),emissao:campo(/Data Emiss[aã]o:\s*(\d{2}\/\d{2}\/\d{4})/i),
-    previsao:campo(/Data Previs[aã]o:\s*(\d{2}\/\d{2}\/\d{4})/i)};
+export async function lerPedidoPdf(file: File): Promise<ParseResult> {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
 
-  const re=/(?:^|\n)\s*(\d+(?:\.\d+)?)\s+(\d{5,})\s+/g;
-  const starts:{i:number,item:string,codigo:string,start:number}[]=[];let m:RegExpExecArray|null;
-  while((m=re.exec(texto)))starts.push({i:m.index,item:m[1],codigo:m[2],start:re.lastIndex});
-  const raw:{item:string,codigo:string,descricao:string,qtd:number}[]=[];
-  for(let i=0;i<starts.length;i++){
-    const s=starts[i],end=i+1<starts.length?starts[i+1].i:texto.length,block=clean(texto.slice(s.start,end));
-    const q=block.match(/\b(CJ|UN|PC|JG|PCS)\s+(\d{1,6}(?:[.,]\d{3})?)\b/i);
-    if(!q)continue;
-    const qtd=Number(q[2].replace(".","").replace(",","."));
-    const descricao=clean(block.slice(0,q.index));
-    if(descricao&&Number.isFinite(qtd))raw.push({item:s.item,codigo:s.codigo,descricao,qtd});
+  // Worker do PDF.js empacotado junto com o projeto
+  pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+    "pdfjs-dist/legacy/build/pdf.worker.min.mjs",
+    import.meta.url
+  ).toString();
+
+  const buffer = await file.arrayBuffer();
+
+  const pdf = await pdfjs.getDocument({
+    data: new Uint8Array(buffer),
+    useWorkerFetch: false,
+    isEvalSupported: false,
+    useSystemFonts: true,
+  }).promise;
+
+  const paginas: string[] = [];
+
+  for (let numeroPagina = 1; numeroPagina <= pdf.numPages; numeroPagina++) {
+    const page = await pdf.getPage(numeroPagina);
+
+    const content = await page.getTextContent();
+
+    /*
+      NÃO juntamos simplesmente a página inteira.
+
+      Tentamos reconstruir as linhas de acordo com a posição
+      vertical original do PDF.
+    */
+
+    const itens = (content.items as any[])
+      .filter((item) => item.str && item.str.trim())
+      .map((item) => ({
+        texto: String(item.str).trim(),
+        x: Number(item.transform?.[4] || 0),
+        y: Number(item.transform?.[5] || 0),
+      }))
+      .sort((a, b) => {
+        const diferencaY = Math.abs(a.y - b.y);
+
+        if (diferencaY > 3) {
+          return b.y - a.y;
+        }
+
+        return a.x - b.x;
+      });
+
+    const linhas: {
+      y: number;
+      itens: {
+        texto: string;
+        x: number;
+      }[];
+    }[] = [];
+
+    for (const item of itens) {
+      let linha = linhas.find(
+        (linhaAtual) =>
+          Math.abs(linhaAtual.y - item.y) <= 3
+      );
+
+      if (!linha) {
+        linha = {
+          y: item.y,
+          itens: [],
+        };
+
+        linhas.push(linha);
+      }
+
+      linha.itens.push({
+        texto: item.texto,
+        x: item.x,
+      });
+    }
+
+    linhas.sort(
+      (a, b) => b.y - a.y
+    );
+
+    const textoPagina = linhas
+      .map((linha) => {
+        linha.itens.sort(
+          (a, b) => a.x - b.x
+        );
+
+        return linha.itens
+          .map((item) => item.texto)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    paginas.push(textoPagina);
   }
-  const parents=new Set(raw.filter(r=>raw.some(x=>x.item.startsWith(r.item+"."))).map(r=>r.item));
-  const fisicos=raw.filter(r=>!parents.has(r.item));
-  const produtos=fisicos.flatMap(r=>expandir(meta.pedido,r.item,r.codigo,r.descricao,r.qtd));
-  const revisao=produtos.filter(p=>p.status==="REVISÃO").length;
-  return {meta,produtos,diagnostico:{itens:fisicos.length,linhas:produtos.length,revisao,paginas:pdf.numPages}};
+
+  const texto = paginas.join("\n");
+
+  /*
+  |--------------------------------------------------------------------------
+  | CABEÇALHO
+  |--------------------------------------------------------------------------
+  */
+
+  const campo = (
+    regex: RegExp
+  ) =>
+    clean(
+      texto.match(regex)?.[1] ||
+        ""
+    );
+
+  const meta = {
+    pedido: campo(
+      /Pedido:\s*(\d+)/i
+    ),
+
+    cliente: campo(
+      /Cliente:\s*(.+?)(?=\s+CNPJ:|\s+Endere[cç]o:|\n)/i
+    ),
+
+    cidade: campo(
+      /Cidade:\s*(.+?)(?=\s+Data Emiss[aã]o:|\n)/i
+    ),
+
+    emissao: campo(
+      /Data Emiss[aã]o:\s*(\d{2}\/\d{2}\/\d{4})/i
+    ),
+
+    previsao: campo(
+      /Data Previs[aã]o:\s*(\d{2}\/\d{2}\/\d{4})/i
+    ),
+  };
+
+  /*
+  |--------------------------------------------------------------------------
+  | RECONSTRUÇÃO DOS ITENS
+  |--------------------------------------------------------------------------
+  */
+
+  const linhasTexto =
+    texto.split("\n");
+
+  type RawItem = {
+    item: string;
+    codigo: string;
+    descricao: string;
+    qtd: number;
+  };
+
+  const itensBrutos: RawItem[] =
+    [];
+
+  let atual:
+    | {
+        item: string;
+        codigo: string;
+        descricao: string[];
+      }
+    | null = null;
+
+  const finalizarAtual = (
+    quantidade: number
+  ) => {
+    if (!atual) return;
+
+    const descricao =
+      clean(
+        atual.descricao.join(" ")
+      );
+
+    if (
+      descricao &&
+      quantidade > 0
+    ) {
+      itensBrutos.push({
+        item: atual.item,
+        codigo: atual.codigo,
+        descricao,
+        qtd: quantidade,
+      });
+    }
+
+    atual = null;
+  };
+
+  for (
+    const linhaOriginal
+    of linhasTexto
+  ) {
+    const linha =
+      linhaOriginal.trim();
+
+    if (!linha) continue;
+
+    /*
+      Exemplos:
+
+      1.1 421020008
+      7.2 1393032221
+      12 3070302374
+    */
+
+    const inicioItem =
+      linha.match(
+        /^(\d+(?:\.\d+)?)\s+(\d{5,})(?:\s+(.*))?$/
+      );
+
+    if (inicioItem) {
+      atual = {
+        item: inicioItem[1],
+
+        codigo:
+          inicioItem[2],
+
+        descricao:
+          inicioItem[3]
+            ? [
+                inicioItem[3],
+              ]
+            : [],
+      };
+
+      continue;
+    }
+
+    if (!atual) {
+      continue;
+    }
+
+    /*
+      Final típico do produto:
+
+      UN 15,000 11,010 ...
+      PC 7,000 ...
+      CJ 2,000 ...
+    */
+
+    const finalProduto =
+      linha.match(
+        /^(.*?)(?:\s+)?\b(CJ|UN|PC|PCS|JG)\s+(\d{1,8}(?:[.,]\d{3})?)(?:\s|$)/i
+      );
+
+    if (finalProduto) {
+      const antesUnidade =
+        finalProduto[1]?.trim();
+
+      if (antesUnidade) {
+        atual.descricao.push(
+          antesUnidade
+        );
+      }
+
+      const quantidade =
+        Number(
+          finalProduto[3]
+            .replace(
+              /\./g,
+              ""
+            )
+            .replace(
+              ",",
+              "."
+            )
+        );
+
+      finalizarAtual(
+        quantidade
+      );
+
+      continue;
+    }
+
+    /*
+      Continua descrição do item.
+    */
+
+    atual.descricao.push(
+      linha
+    );
+  }
+
+  /*
+  |--------------------------------------------------------------------------
+  | ITEM PAI / SUBITEM
+  |--------------------------------------------------------------------------
+  */
+
+  const pais =
+    new Set<string>();
+
+  for (
+    const candidato
+    of itensBrutos
+  ) {
+    const possuiFilhos =
+      itensBrutos.some(
+        (outro) =>
+          outro.item.startsWith(
+            `${candidato.item}.`
+          )
+      );
+
+    if (possuiFilhos) {
+      pais.add(
+        candidato.item
+      );
+    }
+  }
+
+  const itensFisicos =
+    itensBrutos.filter(
+      (item) =>
+        !pais.has(
+          item.item
+        )
+    );
+
+  /*
+  |--------------------------------------------------------------------------
+  | CONVERTE PARA PRODUÇÃO
+  |--------------------------------------------------------------------------
+  */
+
+  const produtos =
+    itensFisicos.flatMap(
+      (item) =>
+        expandir(
+          meta.pedido,
+          item.item,
+          item.codigo,
+          item.descricao,
+          item.qtd
+        )
+    );
+
+  const revisao =
+    produtos.filter(
+      (produto) =>
+        produto.status ===
+        "REVISÃO"
+    ).length;
+
+  return {
+    meta,
+
+    produtos,
+
+    diagnostico: {
+      itens:
+        itensFisicos.length,
+
+      linhas:
+        produtos.length,
+
+      revisao,
+
+      paginas:
+        pdf.numPages,
+    },
+  };
 }
 
 export function metricas(produtos:Produto[]){
